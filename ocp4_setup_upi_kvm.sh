@@ -65,6 +65,21 @@ case $key in
     shift
     shift
     ;;
+    --lb-prefix)
+    LB_PREFIX="$2"
+    shift
+    shift
+    ;;
+    --lb-domain)
+    LB_DOMAIN="$2"
+    shift
+    shift
+    ;;
+    --lb-hash)
+    LB_HASH="$2"
+    shift
+    shift
+    ;;
     -d|--cluster-domain)
     BASE_DOM="$2"
     shift
@@ -158,6 +173,15 @@ case $key in
     YES="yes"
     shift
     ;;
+    --direct)
+    DIRECT="yes"
+    shift
+    ;;
+    --direct-net)
+    DIRECT_VIR_NET="$2"
+    shift
+    shift
+    ;;
     -h|--help)
     SHOW_HELP="yes"
     shift
@@ -180,7 +204,8 @@ test -z "$WOR_MEM" && WOR_MEM="8000"
 test -z "$BTS_CPU" && BTS_CPU="4"
 test -z "$BTS_MEM" && BTS_MEM="16000"
 test -z "$LB_CPU" && LB_CPU="1"
-test -z "$LB_MEM" && LB_MEM="1024"
+test -z "$LB_MEM" && LB_MEM="1536"
+test -n "$DIRECT" -a -z "$DIRECT_VIR_NET" && DIRECT_VIR_NET="default"
 test -z "$VIR_NET" -a -z "$VIR_NET_OCT" && VIR_NET="default"
 test -n "$VIR_NET" -a -n "$VIR_NET_OCT" && err "Specify either -n or -N" 
 test -z "$CLUSTER_NAME" && CLUSTER_NAME="ocp4"
@@ -191,9 +216,12 @@ test -z "$SETUP_DIR" && SETUP_DIR="/root/ocp4_setup_${CLUSTER_NAME}"
 test -z "$CACHE_DIR" && CACHE_DIR="/root/ocp4_downloads" && mkdir -p "$CACHE_DIR"
 test -z "$PULL_SEC_F" && PULL_SEC_F="/root/pull-secret"; PULL_SEC=$(cat "$PULL_SEC_F")
 
+test -n "$LB_PREFIX" -a -n "$LB_DOMAIN" -a -n "$LB_HASH" || test -z "$LB_PREFIX" -a -z "$LB_DOMAIN" -a -z "$LB_HASH" || err "Must specify --lb-domain, --lb-prefix and --lb-hash"
+
 OCP_MIRROR="https://mirror.openshift.com/pub/openshift-v4/clients/ocp"
 RHCOS_MIRROR="https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos"
-LB_IMG_URL="https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2"
+LB_IMG="CentOS-8-GenericCloud-8.1.1911-20200113.3.x86_64.qcow2"
+LB_IMG_URL="https://cloud.centos.org/centos/8/x86_64/images/${LB_IMG}"
 
 if [ "$SHOW_HELP" == "yes" ]; then
 echo
@@ -364,7 +392,7 @@ if [ "$CLEANUP" == "yes" ]; then
         err "Deleting DHCP reservation failed"; ok
         echo -n "XXXX> Deleting VM $vm: "
         virsh destroy "$vm" > /dev/null || err "virsh destroy $vm failed";
-        virsh undefine "$vm" --remove-all-storage > /dev/null || err "virsh destroy $vm --remove-all-storage failed";
+        virsh undefine "$vm" --remove-all-storage > /dev/null || ok "virsh destroy $vm --remove-all-storage failed";
         ok
     done
 
@@ -389,8 +417,8 @@ if [ "$CLEANUP" == "yes" ]; then
     cat /etc/hosts | grep -v "^#" | grep -q -s "${CLUSTER_NAME}\.${BASE_DOM}$" > /dev/null
     if [ "$?" == "0" ]; then
         check_if_we_can_continue "Commenting entries in /etc/hosts for ${CLUSTER_NAME}.${BASE_DOM}"
-        echo -n "XXXX> Commenting entries in /etc/hosts for ${CLUSTER_NAME}.${BASE_DOM}: "
-        sed -i "s/\(.*\.${CLUSTER_NAME}\.${BASE_DOM}$\)/#\1/" "/etc/hosts" || err "sed failed"
+        echo -n "XXXX> Removing entries in /etc/hosts for ${CLUSTER_NAME}.${BASE_DOM}: "
+        sed -i "/\(.*\.${CLUSTER_NAME}\.${BASE_DOM}$\)/ d" "/etc/hosts" || err "sed failed"
         ok
     fi
 
@@ -554,6 +582,12 @@ else
     err "Sorry, unhandled situation. Exiting"
 fi
 
+if [ -n "$DIRECT" ]; then
+    virsh net-uuid "${DIRECT_VIR_NET}" &> /dev/null || \
+        err "${DIRECT_VIR_NET} doesn't exist"
+    ok "using $DIRECT_VIR_NET for direct network"
+fi
+
 echo -n "====> Checking if we have any existing leftover VMs: "
 existing=$(virsh list --all --name | grep -m1 "${CLUSTER_NAME}-lb\|${CLUSTER_NAME}-master-\|${CLUSTER_NAME}-worker-\|${CLUSTER_NAME}-bootstrap") || true
 test -z "$existing" || err "Found existing VM: $existing"
@@ -588,6 +622,21 @@ echo "### DOWNLOAD AND PREPARE OPENSHIFT 4 INSTALLATION ###"
 echo "#####################################################"
 echo
 
+if [ -n "$DIRECT" ]; then
+    echo -n "====> Will use direct network"
+    DIRECT_IFACE=$(virsh iface-list | tail -n +3 | sed -e '/^$/d' | awk '{print $1}')
+    virsh iface-mac --interface "${DIRECT_IFACE}" &>/dev/null || err "Could not determine network name"
+    cat <<EOF > /tmp/${DIRECT_VIR_NET}.xml
+    <interface type="direct"> \\
+      <source dev="${DIRECT_IFACE}" mode="bridge" /> \\
+      <target dev="macvtap0" /> \\
+      <model type="virtio" /> \\
+      <alias name="net1" /> \\
+      <address type="pci" domain="0x0000" bus="0x00" slot="0x03" function="0x0" /> \\
+    </interface> \\
+EOF
+fi
+
 if [ -n "$VIR_NET" ]; then
     virsh net-uuid "${VIR_NET}" &> /dev/null || \
         err "${VIR_NET} doesn't exist"
@@ -619,6 +668,10 @@ else
     err "Sorry, unhandled situation. Exiting"
 fi
 
+if [ -n "$DIRECT_VIR_NET" ]; then
+    virsh net-uuid "${DIRECT_VIR_NET}" &> /dev/null || \
+        err "${DIRECT_VIR_NET} doesn't exist"
+fi
 
 echo -n "====> Creating and using directory $SETUP_DIR: "
 mkdir -p $SETUP_DIR && cd $SETUP_DIR || err "using $SETUP_DIR failed"
@@ -691,7 +744,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt
-ExecStart=/usr/bin/python -m SimpleHTTPServer ${WS_PORT}
+ExecStart=/usr/bin/python3 -m http.server ${WS_PORT}
 [Install]
 WantedBy=default.target
 EOF
@@ -723,7 +776,8 @@ defaults
   timeout check 10s
   maxconn 3000
 # 6443 points to control plan
-frontend ${CLUSTER_NAME}-api *:6443
+frontend ${CLUSTER_NAME}-api
+  bind *:6443
   default_backend master-api
 backend master-api
   balance source
@@ -735,7 +789,8 @@ done
 echo "
 
 # 22623 points to control plane
-frontend ${CLUSTER_NAME}-mapi *:22623
+frontend ${CLUSTER_NAME}-mapi
+  bind *:22623
   default_backend master-mapi
 backend master-mapi
   balance source
@@ -746,7 +801,8 @@ do
 done
 echo "
 # 80 points to master nodes
-frontend ${CLUSTER_NAME}-http *:80
+frontend ${CLUSTER_NAME}-http
+  bind *:80
   default_backend ingress-http
 backend ingress-http
   balance source" >> haproxy.cfg
@@ -756,7 +812,8 @@ do
 done
 echo "
 # 443 points to master nodes
-frontend ${CLUSTER_NAME}-https *:443
+frontend ${CLUSTER_NAME}-https
+  bind *:443
   default_backend infra-https
 backend infra-https
   balance source" >> haproxy.cfg
@@ -774,29 +831,70 @@ echo "#################################"
 echo
 
 
-echo -n "====> Downloading Centos 7 cloud image: "; download get "$LB_IMG" "$LB_IMG_URL";
+echo -n "====> Downloading Centos cloud image: "; download get "$LB_IMG" "$LB_IMG_URL";
 
 echo -n "====> Copying Image for Loadbalancer VM: "
-cp "${CACHE_DIR}/CentOS-7-x86_64-GenericCloud.qcow2" "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" || \
-    err "Copying '${VM_DIR}/CentOS-7-x86_64-GenericCloud.qcow2' to '${VM_DIR}/${CLUSTER_NAME}-lb.qcow2' failed"; ok
+cp "${CACHE_DIR}/${LB_IMG}" "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" || \
+    err "Copying '${VM_DIR}/${LB_IMG}' to '${VM_DIR}/${CLUSTER_NAME}-lb.qcow2' failed"; ok
 
 echo "====> Setting up Loadbalancer VM: "
+
 virt-customize -a "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" \
-    --uninstall cloud-init --ssh-inject root:file:$SSH_KEY --selinux-relabel --install haproxy --install bind-utils \
+    --root-password random \
+    --uninstall cloud-init --ssh-inject root:file:$SSH_KEY --selinux-relabel --install haproxy --install bind-utils --install python3 \
     --copy-in install_dir/bootstrap.ign:/opt/ --copy-in install_dir/master.ign:/opt/ --copy-in install_dir/worker.ign:/opt/ \
     --copy-in "${CACHE_DIR}/${IMAGE}":/opt/ --copy-in tmpws.service:/etc/systemd/system/ \
     --copy-in haproxy.cfg:/etc/haproxy/ \
     --run-command "systemctl daemon-reload" --run-command "systemctl enable tmpws.service" || \
     err "Setting up Loadbalancer VM image ${VM_DIR}/${CLUSTER_NAME}-lb.qcow2 failed"
 
+if [ -n "$DIRECT" ] ; then
+    NAMESERVER=$(virsh net-dumpxml ${VIR_NET} | grep '<ip' | awk '{print $2}' | sed -e 's+^.*'"'"'\([^'"'"']*\)'"'"'.*$+\1+')
+    virt-customize -a "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" \
+        --selinux-relabel \
+        --run-command "echo IPV4_ROUTE_METRIC=1 >> /etc/sysconfig/network-scripts/ifcfg-eth0" \
+        --run-command "echo PEERDNS=no >> /etc/sysconfig/network-scripts/ifcfg-eth0" \
+        || \
+    err "Setting up Default route and nameserver for Loadbalancer VM image ${VM_DIR}/${CLUSTER_NAME}-lb.qcow2 failed"
+fi
+
+if [ -n "$LB_PREFIX" -a -n "$LB_DOMAIN" -a -n "$LB_HASH" ]; then
+    cat <<EOF > ddns.service
+[Unit]
+Description=Red Hat DDNS service
+After=network.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/curl -k "https://ddns.corp.redhat.com/redhat-ddns/updater.php?name=${LB_PREFIX}lb&domain=${LB_DOMAIN}&hash=${LB_HASH}"
+TimeoutSec=0
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+EOF
+    virt-customize -a "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" \
+        --copy-in ddns.service:/etc/systemd/system/ --selinux-relabel \
+        --run-command "systemctl enable ddns.service" || \
+    err "Setting up DDNS for Loadbalancer VM image ${VM_DIR}/${CLUSTER_NAME}-lb.qcow2 failed"
+fi
+
 echo -n "====> Creating Loadbalancer VM: "
 virt-install --import --name ${CLUSTER_NAME}-lb --disk "${VM_DIR}/${CLUSTER_NAME}-lb.qcow2" \
-    --memory ${LB_MEM} --cpu host --vcpus ${LB_CPU} --os-type linux --os-variant rhel7-unknown --network network=${VIR_NET},model=virtio \
-    --noreboot --noautoconsole > /dev/null || \
-    err "Creating Loadbalancer VM from ${VM_DIR}/${CLUSTER_NAME}-lb.qcow2 failed"; ok
+    --memory ${LB_MEM} --cpu host --vcpus ${LB_CPU} --os-type linux --os-variant rhel8-unknown \
+    --network network=${VIR_NET},model=virtio \
+    --noreboot --noautoconsole --print-xml > lb-install.xml 2>/dev/null || err "Creating Loadbalancer XML config"; ok
 
-echo -n "====> Starting Loadbalancer VM "
-virsh start ${CLUSTER_NAME}-lb > /dev/null || err "Starting Loadbalancer VM ${CLUSTER_NAME}-lb failed"; ok
+if [ -n "${DIRECT}" ] ; then
+  sed -i -e "/<controller/ a \\
+$(cat /tmp/${DIRECT_VIR_NET}.xml)" lb-install.xml
+fi
+
+virsh create lb-install.xml &> /dev/null || \
+    err "Creating Loadbalancer VM from ${VM_DIR}/${CLUSTER_NAME}-lb.qcow2 failed"; ok
 
 echo -n "====> Waiting for Loadbalancer VM to obtain IP address: "
 while true; do
@@ -875,7 +973,7 @@ fi
 echo -n "====> Creating Boostrap VM: "
 virt-install --name ${CLUSTER_NAME}-bootstrap \
   --disk "${VM_DIR}/${CLUSTER_NAME}-bootstrap.qcow2,size=50" --ram ${BTS_MEM} --cpu host --vcpus ${BTS_CPU} \
-  --os-type linux --os-variant rhel7-unknown \
+  --os-type linux --os-variant rhel8-unknown \
   --network network=${VIR_NET},model=virtio --noreboot --noautoconsole \
   --location rhcos-install/ \
   --extra-args "nomodeset rd.neednet=1 coreos.inst=yes coreos.inst.install_dev=vda ${RHCOS_I_ARG}=http://${LBIP}:${WS_PORT}/${IMAGE} coreos.inst.ignition_url=http://${LBIP}:${WS_PORT}/bootstrap.ign" > /dev/null || err "Creating boostrap vm failed"; ok
@@ -885,7 +983,7 @@ do
 echo -n "====> Creating Master-${i} VM: "
 virt-install --name ${CLUSTER_NAME}-master-${i} \
 --disk "${VM_DIR}/${CLUSTER_NAME}-master-${i}.qcow2,size=50" --ram ${MAS_MEM} --cpu host --vcpus ${MAS_CPU} \
---os-type linux --os-variant rhel7-unknown \
+--os-type linux --os-variant rhel8-unknown \
 --network network=${VIR_NET},model=virtio --noreboot --noautoconsole \
 --location rhcos-install/ \
 --extra-args "nomodeset rd.neednet=1 coreos.inst=yes coreos.inst.install_dev=vda ${RHCOS_I_ARG}=http://${LBIP}:${WS_PORT}/${IMAGE} coreos.inst.ignition_url=http://${LBIP}:${WS_PORT}/master.ign" > /dev/null || err "Creating master-${i} vm failed "; ok
@@ -896,7 +994,7 @@ do
 echo -n "====> Creating Worker-${i} VM: "
   virt-install --name ${CLUSTER_NAME}-worker-${i} \
   --disk "${VM_DIR}/${CLUSTER_NAME}-worker-${i}.qcow2,size=50" --ram ${WOR_MEM} --cpu host --vcpus ${WOR_CPU} \
-  --os-type linux --os-variant rhel7-unknown \
+  --os-type linux --os-variant rhel8-unknown \
   --network network=${VIR_NET},model=virtio --noreboot --noautoconsole \
   --location rhcos-install/ \
   --extra-args "nomodeset rd.neednet=1 coreos.inst=yes coreos.inst.install_dev=vda ${RHCOS_I_ARG}=http://${LBIP}:${WS_PORT}/${IMAGE} coreos.inst.ignition_url=http://${LBIP}:${WS_PORT}/worker.ign" > /dev/null || err "Creating worker-${i} vm failed "; ok

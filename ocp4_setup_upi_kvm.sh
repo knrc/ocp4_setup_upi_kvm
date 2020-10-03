@@ -177,6 +177,10 @@ case $key in
     DIRECT="yes"
     shift
     ;;
+    --fips)
+    FIPS="enabled"
+    shift
+    ;;
     --direct-net)
     DIRECT_VIR_NET="$2"
     shift
@@ -215,6 +219,7 @@ test -z "$VM_DIR" && VM_DIR="/var/lib/libvirt/images"
 test -z "$SETUP_DIR" && SETUP_DIR="/root/ocp4_setup_${CLUSTER_NAME}"
 test -z "$CACHE_DIR" && CACHE_DIR="/root/ocp4_downloads" && mkdir -p "$CACHE_DIR"
 test -z "$PULL_SEC_F" && PULL_SEC_F="/root/pull-secret"; PULL_SEC=$(cat "$PULL_SEC_F")
+test -z "$FIPS" && FIPS="disabled"
 
 test -n "$LB_PREFIX" -a -n "$LB_DOMAIN" -a -n "$LB_HASH" || test -z "$LB_PREFIX" -a -z "$LB_DOMAIN" -a -z "$LB_HASH" || err "Must specify --lb-domain, --lb-prefix and --lb-hash"
 
@@ -313,6 +318,22 @@ cat << EOF | column -L -t -s '|' -N OPTION,DESCRIPTION -W DESCRIPTION
 |Use this option with the same options you used to install the cluster.
 |Be carefull this deletes the VMs, DNS entries and the libvirt network (if created by the script)
 |Default: <not set>
+
+--lb-prefix|The prefix for the load balancer hostname registered with the RH dynamic DNS service, lb will be appended
+|e.g. specifying a prefix of prefix- will result in the hostname prefix-lb being used
+
+--lb-domain|The domain name for the load balancer's hostnamae as registered with the RH dynamic DNS service
+
+--lb-hash|The hash used to configure the load balancer's external IP address with the RH dynamic DNS service
+
+--direct|Enable direct access from an external network
+
+--direct-net|The virtual network name to use for direct access from an external network
+|Default: default
+
+--fips|Enable fips mode
+|Default: disabled
+
 EOF
 echo
 echo "Examples:"
@@ -704,8 +725,8 @@ initrd = initramfs.img
 kernel = vmlinuz
 EOF
 
-
 mkdir install_dir
+
 cat <<EOF > install_dir/install-config.yaml
 apiVersion: v1
 baseDomain: ${BASE_DOM}
@@ -731,6 +752,22 @@ platform:
 pullSecret: '${PULL_SEC}'
 sshKey: '$(cat $SSH_KEY)'
 EOF
+
+
+echo "====> Creating manifests: FIPS ${FIPS}"
+./openshift-install create manifests --dir=./install_dir || \
+    err "./openshift-install create manifests --dir=./install_dir failed"
+
+if [ "$FIPS" == "enabled" ]
+then
+  for file in \
+      99_openshift-machineconfig_99-master-disable-hyperthreading.yaml \
+      99_openshift-machineconfig_99-master-ssh.yaml \
+      99_openshift-machineconfig_99-worker-disable-hyperthreading.yaml \
+      99_openshift-machineconfig_99-worker-ssh.yaml ; do
+    sed -i -e '/^.*fips:/ s/false/true/' install_dir/openshift/${file}
+  done
+fi
 
 
 echo "====> Creating ignition configs: "

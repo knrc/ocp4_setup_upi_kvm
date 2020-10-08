@@ -186,6 +186,26 @@ case $key in
     shift
     shift
     ;;
+    --dnsmasq-svc)
+    DNSMASQ_SVC="$2"
+    shift
+    shift
+    ;;
+    --dnsmasq-interface)
+    DNSMASQ_INTERFACE="$2"
+    shift
+    shift
+    ;;
+    --dnsmasq-dir)
+    DNSMASQ_OPENSHIFT_CONF_DIR="$2"
+    shift
+    shift
+    ;;
+    --dnsmasq-domains)
+    DNSMASQ_DOMAIN_NAMES="$2"
+    shift
+    shift
+    ;;
     -h|--help)
     SHOW_HELP="yes"
     shift
@@ -220,6 +240,7 @@ test -z "$SETUP_DIR" && SETUP_DIR="/root/ocp4_setup_${CLUSTER_NAME}"
 test -z "$CACHE_DIR" && CACHE_DIR="/root/ocp4_downloads" && mkdir -p "$CACHE_DIR"
 test -z "$PULL_SEC_F" && PULL_SEC_F="/root/pull-secret"; PULL_SEC=$(cat "$PULL_SEC_F")
 test -z "$FIPS" && FIPS="disabled"
+test -z "$DNSMASQ_OPENSHIFT_CONF_DIR" && DNSMASQ_OPENSHIFT_CONF_DIR="/etc/dnsmasq.d"
 
 test -n "$LB_PREFIX" -a -n "$LB_DOMAIN" -a -n "$LB_HASH" || test -z "$LB_PREFIX" -a -z "$LB_DOMAIN" -a -z "$LB_HASH" || err "Must specify --lb-domain, --lb-prefix and --lb-hash"
 
@@ -450,6 +471,18 @@ if [ "$CLEANUP" == "yes" ]; then
         ok
     fi
 
+    if [ -n "${DNSMASQ_SVC}" -a -n "${DNSMASQ_INTERFACE}" ] ; then
+        DNSMASQ_OPENSHIFT_CONF="${DNSMASQ_OPENSHIFT_CONF_DIR}/${DNSMASQ_SVC}.conf"
+
+        if [ -f "${DNSMASQ_OPENSHIFT_CONF}" ] ; then
+            check_if_we_can_continue "Removing entries from external dnsmasq"
+            echo -n "XXXX> Removing entries from external dnsmasq: "
+            for domainname in apps.${CLUSTER_NAME}.${BASE_DOM} api.${CLUSTER_NAME}.${BASE_DOM} ${DNSMASQ_DOMAIN_NAMES} ; do
+                sed -i -e "/${domainname}/ d" "${DNSMASQ_OPENSHIFT_CONF}"
+            done
+            ok
+        fi
+    fi
     exit
 fi
 
@@ -961,6 +994,56 @@ done
 ssh -i sshkey "lb.${CLUSTER_NAME}.${BASE_DOM}" true || err "SSH to lb.${CLUSTER_NAME}.${BASE_DOM} failed"; ok
 
 
+echo
+echo "##############################"
+echo "#### DNSMASQ Configuration ###"
+echo "##############################"
+echo
+
+EXTERNAL_LB_IP=$(ssh -i sshkey "lb.${CLUSTER_NAME}.${BASE_DOM}" ip -4 address show dev eth0 | grep inet | awk '{print $2}' | sed -e 's+/.*$++')
+
+if [ -n "${DNSMASQ_SVC}" -a -n "${DNSMASQ_INTERFACE}" ] ; then
+  DNSMASQ_OPENSHIFT_CONF="${DNSMASQ_OPENSHIFT_CONF_DIR}/${DNSMASQ_SVC}.conf"
+
+  if [ ! -f "${DNSMASQ_OPENSHIFT_CONF}" ] ; then
+    mkdir -p "${DNSMASQ_OPENSHIFT_CONF_DIR}"
+    cat - > "${DNSMASQ_OPENSHIFT_CONF}" << EOF
+no-resolv
+bind-interfaces
+no-hosts
+
+interface=${DNSMASQ_INTERFACE}
+except-interface=lo
+
+EOF
+  fi
+  for domainname in apps.${CLUSTER_NAME}.${BASE_DOM} api.${CLUSTER_NAME}.${BASE_DOM} ${DNSMASQ_DOMAIN_NAMES} ; do
+    sed -i -e "/${domainname}/ d" "${DNSMASQ_OPENSHIFT_CONF}"
+    echo "address=/${domainname}/${EXTERNAL_LB_IP}" >> "${DNSMASQ_OPENSHIFT_CONF}"
+  done
+
+  DNSMASQ_SVC_CONF="/etc/systemd/system/${DNSMASQ_SVC}.service"
+  if [ ! -f "${DNSMASQ_SVC_CONF}" ] ; then
+    cat - > "${DNSMASQ_SVC_CONF}" << EOF
+[Unit]
+Description=DNS server for OpenShift installations.
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq -k --conf-file=${DNSMASQ_OPENSHIFT_CONF}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable "${DNSMASQ_SVC}"
+    systemctl start "${DNSMASQ_SVC}"
+  else
+    systemctl restart "${DNSMASQ_SVC}"
+  fi
+fi
 
 echo 
 echo "##################"

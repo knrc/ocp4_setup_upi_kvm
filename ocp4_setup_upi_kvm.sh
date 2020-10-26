@@ -181,6 +181,10 @@ case $key in
     FIPS="enabled"
     shift
     ;;
+    --ovn)
+    NETWORK_TYPE="OVNKubernetes"
+    shift
+    ;;
     --direct-net)
     DIRECT_VIR_NET="$2"
     shift
@@ -240,6 +244,7 @@ test -z "$SETUP_DIR" && SETUP_DIR="/root/ocp4_setup_${CLUSTER_NAME}"
 test -z "$CACHE_DIR" && CACHE_DIR="/root/ocp4_downloads" && mkdir -p "$CACHE_DIR"
 test -z "$PULL_SEC_F" && PULL_SEC_F="/root/pull-secret"; PULL_SEC=$(cat "$PULL_SEC_F")
 test -z "$FIPS" && FIPS="disabled"
+test -z "$NETWORK_TYPE" && NETWORK_TYPE="OpenShiftSDN"
 test -z "$DNSMASQ_OPENSHIFT_CONF_DIR" && DNSMASQ_OPENSHIFT_CONF_DIR="/etc/dnsmasq.d"
 
 test -n "$LB_PREFIX" -a -n "$LB_DOMAIN" -a -n "$LB_HASH" || test -z "$LB_PREFIX" -a -z "$LB_DOMAIN" -a -z "$LB_HASH" || err "Must specify --lb-domain, --lb-prefix and --lb-hash"
@@ -777,7 +782,7 @@ networking:
   clusterNetworks:
   - cidr: 10.128.0.0/14
     hostPrefix: 23
-  networkType: OpenShiftSDN
+  networkType: ${NETWORK_TYPE}
   serviceNetwork:
   - 172.30.0.0/16
 platform:

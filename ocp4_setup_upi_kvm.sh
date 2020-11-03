@@ -206,6 +206,12 @@ case $key in
     shift
     shift
     ;;
+    --local-storage)
+    test "$2" -gt "0" &>/dev/null || err "Invalid value $2 for --local-storage"
+    LOCAL_STORAGE_SIZE="$2"
+    shift
+    shift
+    ;;
     -h|--help)
     SHOW_HELP="yes"
     shift
@@ -289,6 +295,9 @@ cat << EOF | column -L -t -s '|' -N OPTION,DESCRIPTION -W DESCRIPTION
 
 --worker-mem SIZE(MB)|Worker VMs Memory (in MB)
 |Default: 8000
+
+--local-storage SIZE(GB)|Worker local storage (in GB)
+|Default: <not set>
 
 --bootstrap-cpu N|Bootstrap VM CPUs
 |Default: 4
@@ -1080,9 +1089,14 @@ virt-install --name ${CLUSTER_NAME}-bootstrap \
 
 for i in $(seq 1 ${N_MAST})
 do
+  if [ -n "${LOCAL_STORAGE_SIZE}" ] ; then
+    LOCAL_STORAGE_DISK="--disk ${VM_DIR}/${CLUSTER_NAME}-master-${i}-local.qcow2,size=${LOCAL_STORAGE_SIZE}"
+  else
+    LOCAL_STORAGE_DISK=""
+  fi
 echo -n "====> Creating Master-${i} VM: "
 virt-install --name ${CLUSTER_NAME}-master-${i} \
---disk "${VM_DIR}/${CLUSTER_NAME}-master-${i}.qcow2,size=50" --ram ${MAS_MEM} --cpu host --vcpus ${MAS_CPU} \
+--disk "${VM_DIR}/${CLUSTER_NAME}-master-${i}.qcow2,size=50" --ram ${MAS_MEM} --cpu host --vcpus ${MAS_CPU} ${LOCAL_STORAGE_DISK} \
 --os-type linux --os-variant rhel8-unknown \
 --network network=${VIR_NET},model=virtio --noreboot --noautoconsole \
 --location rhcos-install/ \
@@ -1091,9 +1105,14 @@ done
 
 for i in $(seq 1 ${N_WORK})
 do
+  if [ -n "${LOCAL_STORAGE_SIZE}" ] ; then
+    LOCAL_STORAGE_DISK="--disk ${VM_DIR}/${CLUSTER_NAME}-worker-${i}-local.qcow2,size=${LOCAL_STORAGE_SIZE}"
+  else
+    LOCAL_STORAGE_DISK=""
+  fi
 echo -n "====> Creating Worker-${i} VM: "
   virt-install --name ${CLUSTER_NAME}-worker-${i} \
-  --disk "${VM_DIR}/${CLUSTER_NAME}-worker-${i}.qcow2,size=50" --ram ${WOR_MEM} --cpu host --vcpus ${WOR_CPU} \
+  --disk "${VM_DIR}/${CLUSTER_NAME}-worker-${i}.qcow2,size=50" --ram ${WOR_MEM} --cpu host --vcpus ${WOR_CPU} ${LOCAL_STORAGE_DISK} \
   --os-type linux --os-variant rhel8-unknown \
   --network network=${VIR_NET},model=virtio --noreboot --noautoconsole \
   --location rhcos-install/ \
@@ -1378,6 +1397,72 @@ do
     output_delay=$(( output_delay + 1 ))
     sleep 15
 done
+
+echo
+echo "###############################"
+echo "#### Checking Local Storage ###"
+echo "###############################"
+echo
+if [ -n "${LOCAL_STORAGE_SIZE}" ] ; then
+  echo "====> Configuring Local Storage"
+  version=$(./oc get clusterversion -o jsonpath='{.items[*].status.conditions[?(.type=="Available")].message }' 2> /dev/null | sed -e 's+Done applying \([0-9]*\.[0-9]*\)\.[0-9]*+\1+')
+
+  ./oc new-project local-storage >/dev/null 2>&1 || err "Failed to create local-storage namespace"; ok
+  ./oc create -f - << EOF
+apiVersion: operators.coreos.com/v1alpha2
+kind: OperatorGroup
+metadata:
+  name: local-operator-group
+  namespace: local-storage
+spec:
+  targetNamespaces:
+    - local-storage
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: local-storage-operator
+  namespace: local-storage
+spec:
+  channel: "$version"
+  installPlanApproval: Automatic
+  name: local-storage-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+  ./oc wait --timeout=-1s --for=condition=CatalogSourcesUnhealthy=False subscription local-storage-operator || err "Catalog Sources Unhealthy";ok
+
+  while : ; do
+    crd=$(./oc get crd | grep localvolumes.local.storage.openshift.io ; true)
+    if [ -z "$crd" ] ; then
+      sleep 1
+    else
+      break
+    fi
+  done
+
+  ./oc create -f - << EOF
+apiVersion: "local.storage.openshift.io/v1"
+kind: "LocalVolume"
+metadata:
+  name: "local-disks"
+  namespace: "local-storage"
+spec:
+  nodeSelector:
+    nodeSelectorTerms:
+    - matchExpressions:
+      - key: node-role.kubernetes.io/worker
+        operator: In
+        values:
+        - ""
+  storageClassDevices:
+    - storageClassName: "localblock-sc"
+      volumeMode: Block
+      devicePaths:
+        - /dev/vdb
+EOF
+fi
 
 END_TS=$(date +%s)
 TIME_TAKEN="$(( ($END_TS - $START_TS) / 60 ))"

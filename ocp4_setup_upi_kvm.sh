@@ -1498,8 +1498,9 @@ spec:
         values:
         - ""
   storageClassDevices:
-    - storageClassName: "localblock-sc"
-      volumeMode: Block
+    - storageClassName: "local-sc"
+      volumeMode: Filesystem
+      fsType: xfs
       devicePaths:
         - /dev/vdb
 EOF
